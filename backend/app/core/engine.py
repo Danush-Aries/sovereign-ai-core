@@ -18,7 +18,7 @@ from chromadb.config import Settings
 # ==============================================================================
 class SovereignConfig:
     """Global configuration for the Local-First AI Sovereignty Platform."""
-    BASE_DIR = Path("/Users/dhanush/Desktop/github projects/sovereign-ai-core")
+    BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
     VAULT_PATH = BASE_DIR / ".sovereign/vault"
     MODEL_CONFIG_PATH = BASE_DIR / ".sovereign/models.json"
     LOG_PATH = BASE_DIR / ".sovereign/logs"
@@ -108,7 +108,7 @@ class LocalSovereignRAG:
     def __init__(self):
         # Initialize ChromaDB in persistent mode
         self.client = ChromaClient(Settings(
-            chroma_db_impl="duckdb",
+            is_persistent=True,
             persist_directory=str(SovereignConfig.VAULT_PATH / "vector_store")
         ))
         self.collection = self.client.get_or_create_collection("sovereign_brain")
