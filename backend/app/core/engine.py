@@ -1,219 +1,377 @@
-import os
-import socket
-import asyncio
+"""
+Sovereign AI Core — FastAPI Application Engine
+Wires together the air-gap controller, vault, RAG engine, and model router
+into a single FastAPI application instance.
+"""
+
+from __future__ import annotations
+
 import logging
-from pathlib import Path
-from typing import Optional, List, Dict, Any, Union
-from datetime import datetime
-from cryptography.fernet import Fernet
-from fastapi import FastAPI, Depends, HTTPException, Security, BackgroundTasks
+from typing import Any, Dict, List, Optional
+
+import httpx
+import chromadb
+from chromadb.utils import embedding_functions
+from fastapi import FastAPI, HTTPException, Security, status
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 from sqlmodel import SQLModel, Session, create_engine, select
-from chromadb import Client as ChromaClient
-from chromadb.config import Settings
 
-# ==============================================================================
-# 🛰️ SOVEREIGN-AI-CORE: ARCHITECTURAL CONSTANTS
-# ==============================================================================
-class SovereignConfig:
-    """Global configuration for the Local-First AI Sovereignty Platform."""
-    BASE_DIR = Path("/Users/dhanush/Desktop/github projects/sovereign-ai-core")
-    VAULT_PATH = BASE_DIR / ".sovereign/vault"
-    MODEL_CONFIG_PATH = BASE_DIR / ".sovereign/models.json"
-    LOG_PATH = BASE_DIR / ".sovereign/logs"
-    SENSITIVE_DATA_SINK = LOG_PATH / "leak_attempts.log"
-    ENCRYPTION_KEY_FILE = VAULT_PATH / "master.key"
-    DB_URL = "sqlite:///./sovereign_core.db"
+from backend.app.config import settings
+from backend.app.core.air_gap import air_gap
+from backend.app.vault.auth_vault import SovereignVault
 
-    @classmethod
-    def ensure_infrastructure(cls):
-        """Bootstraps the necessary directory structure for air-gapped operations."""
-        for path in [cls.VAULT_PATH, cls.MODEL_CONFIG_PATH.parent, cls.LOG_PATH]:
-            path.mkdir(parents=True, exist_ok=True)
+# ── Logging setup ──────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+)
+logger = logging.getLogger("sovereign.engine")
 
-SovereignConfig.ensure_infrastructure()
+# Configure the air-gap controller with the leak-log path now that settings are loaded.
+air_gap._leak_log = settings.leak_log_file
 
-# ==============================================================================
-# 🛡️ NETWORK LAYER: THE AIR-GAP KILL-SWITCH
-# ==============================================================================
-class AirGapController:
-    """
-    Implements a strict network-level interceptor.
-    When sovereign_mode is True, all outbound socket attempts are blocked at the
-     lowest level, ensuring absolute data isolation.
-    """
-    def __init__(self):
-        self.sovereign_mode = False
-        self.blocked_attempts = 0
-        self.logger = logging.getLogger("AirGap")
+# ── Vault ─────────────────────────────────────────────────────────────────────
+vault = SovereignVault(key_file=settings.encryption_key_file)
 
-    def toggle_sovereign_mode(self, enabled: bool):
-        self.sovereign_mode = enabled
-        level = "LOCKED" if enabled else "OPEN"
-        print(f"🚨 [Sovereign-Core] NETWORK STATE CHANGE: {level}")
+# ── Database (SQLite, local) ───────────────────────────────────────────────────
+_engine = create_engine(settings.db_url, echo=False)
 
-    def __call__(self, family: int, type: int, proto: int, flags: Optional[int] = 0):
-        if self.sovereign_mode:
-            self.blocked_attempts += 1
-            # Log leak attempt to a secure local sink
-            with open(SovereignConfig.SENSITIVE_DATA_SINK, "a") as f:
-                f.write(f"[{datetime.utcnow()}] BLOCKED OUTBOUND: family={family}, type={type}, proto={proto}\n")
-            raise PermissionError("Sovereign Mode Active: All outbound network traffic is strictly prohibited.")
-        return socket.socket(family, type, proto)
 
-# Monkey-patching the native socket to enforce global air-gap
-AirGap = AirGapController()
-socket.socket = AirGap
+class QueryRecord(SQLModel, table=True):
+    """Persists every query locally for audit purposes."""
+    __tablename__ = "query_log"  # type: ignore[assignment]
 
-# ==============================================================================
-# 🔐 DATA LAYER: AES-256 ENCRYPTED SOVEREIGN VAULT
-# ==============================================================================
-class SovereignVault:
-    """
-    Handles local-first encryption for sensitive model weights and user data.
-    Zero cloud dependency; key is stored in a protected local file.
-    """
-    def __init__(self):
-        self.key = self._initialize_master_key()
-        self.cipher = Fernet(self.key)
+    id: Optional[int] = Field(default=None, primary_key=True)
+    prompt_hash: str
+    complexity: str
+    used_rag: bool
+    timestamp: str
 
-    def _initialize_master_key(self) -> bytes:
-        if SovereignConfig.ENCRYPTION_KEY_FILE.exists():
-            return SovereignConfig.ENCRYPTION_KEY_FILE.read_bytes()
 
-        # Generate a new high-entropy key if none exists
-        new_key = Fernet.generate_key()
-        SovereignConfig.ENCRYPTION_KEY_FILE.write_bytes(new_key)
-        return new_key
+SQLModel.metadata.create_all(_engine)
 
-    def encrypt_payload(self, data: str) -> bytes:
-        """Encrypts a string payload into a secure token."""
-        return self.cipher.encrypt(data.encode())
 
-    def decrypt_payload(self, token: bytes) -> str:
-        """Decrypts a secure token back into a string."""
-        return self.cipher.decrypt(token).decode()
+def _get_db() -> Session:
+    with Session(_engine) as session:
+        yield session
 
-vault = SovereignVault()
 
-# ==============================================================================
-# 🧠 INTELLIGENCE LAYER: LOCAL RAG ENGINE (ChromaDB)
-# ==============================================================================
+# ── ChromaDB RAG engine ───────────────────────────────────────────────────────
 class LocalSovereignRAG:
     """
-    Local-first Retrieval Augmented Generation.
-    Uses a local vector store to index documents without cloud leaks.
+    Local-first Retrieval-Augmented Generation backed by ChromaDB.
+    Uses the all-MiniLM-L6-v2 sentence-transformer for embeddings so
+    everything runs 100 % on-device — no external API calls.
     """
-    def __init__(self):
-        # Initialize ChromaDB in persistent mode
-        self.client = ChromaClient(Settings(
-            chroma_db_impl="duckdb",
-            persist_directory=str(SovereignConfig.VAULT_PATH / "vector_store")
-        ))
-        self.collection = self.client.get_or_create_collection("sovereign_brain")
 
-    def ingest_document(self, doc_id: str, text: str, metadata: Dict[str, Any]):
-        """
-        Indexes a document using a local embedding model.
-        In a production setup, we use SentenceTransformers locally.
-        """
-        # Implementation of local embedding generation would go here
-        # For the functional burst, we ensure the storage logic is bulletproof
-        self.collection.add(
+    def __init__(self) -> None:
+        # chromadb >= 0.4 uses PersistentClient instead of the removed DuckDB backend
+        self._client = chromadb.PersistentClient(path=str(settings.vector_store_path))
+
+        # Local embedding function — runs on CPU/GPU, zero cloud dependency
+        self._embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name="all-MiniLM-L6-v2"
+        )
+        self._collection = self._client.get_or_create_collection(
+            name="sovereign_brain",
+            embedding_function=self._embed_fn,
+        )
+        logger.info(
+            "RAG engine ready — vector store: %s  |  documents: %d",
+            settings.vector_store_path,
+            self._collection.count(),
+        )
+
+    def ingest_document(
+        self,
+        doc_id: str,
+        text: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Index a document into the local vector store."""
+        self._collection.upsert(
             documents=[text],
-            metadatas=[metadata],
-            ids=[doc_id]
+            metadatas=[metadata or {}],
+            ids=[doc_id],
         )
+        logger.info("Ingested document id=%s (%d chars)", doc_id, len(text))
 
-    def retrieve_context(self, query: str, top_k: int = 5) -> List[Dict]:
-        """Retrieves the most relevant context from the local brain."""
-        results = self.collection.query(
-            query_texts=[query],
-            n_results=top_k
-        )
-        return results['documents'][0]
+    def retrieve_context(self, query: str, top_k: int = 5) -> List[str]:
+        """Return the top-k most relevant document snippets for *query*."""
+        if self._collection.count() == 0:
+            return []
+        results = self._collection.query(query_texts=[query], n_results=min(top_k, self._collection.count()))
+        return results["documents"][0] if results["documents"] else []
+
 
 rag_engine = LocalSovereignRAG()
 
-# ==============================================================================
-# 🚦 MODEL ROUTER: LOCAL LLM ORCHESTRATION (Ollama/vLLM)
-# ==============================================================================
+
+# ── Local Model Router ────────────────────────────────────────────────────────
 class SovereignModelRouter:
     """
-    Routes requests to the best local model based on task complexity.
-    Interfaces with local LLM runners (Ollama, LocalAI, vLLM).
+    Routes inference requests to a local Ollama instance via its HTTP API.
+    Stays on loopback (127.0.0.1) — no data ever leaves the machine.
     """
-    def __init__(self):
-        self.registry = {
-            "lite": {"model": "phi3-mini", "params": {"temp": 0.2, "top_p": 0.9}},
-            "standard": {"model": "llama3-8b", "params": {"temp": 0.7, "top_p": 0.95}},
-            "frontier": {"model": "mixtral-8x7b", "params": {"temp": 0.8, "top_p": 1.0}}
-        }
 
-    async def execute_inference(self, prompt: str, complexity: str = "standard"):
-        target = self.registry.get(complexity, self.registry["standard"])
-        model_name = target["model"]
-
-        # Implementation of the local loopback API call to Ollama/vLLM
-        # This is the a-symmetric link: Request -> Local Model -> Response
-        try:
-            print(f"Sovereign-Router: Executing {complexity} task via {model_name}...")
-            # Simulated local API call to localhost:11434 (Ollama default)
-            # In real deployment, this uses httpx.AsyncClient
-            return f"[Local Model: {model_name}] Processed output for: {prompt[:50]}..."
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Local Model Error: {str(e)}")
-
-router = SovereignModelRouter()
-
-# ==============================================================================
-# 🌐 API GATEWAY: FASTAPI SOVEREIGN INTERFACE
-# ==============================================================================
-app = FastAPI(title="Sovereign-AI-Core Gateway")
-
-class AIQuery(BaseModel):
-    prompt: str
-    complexity: str = "standard"
-    use_rag: bool = True
-
-@app.get("/system/status")
-async def get_system_health():
-    """Returns the current operational state of the sovereignty core."""
-    return {
-        "air_gap": "LOCKED" if AirGap.sovereign_mode else "OPEN",
-        "vault": "Sovereign-Encrypted",
-        "rag_engine": "Operational",
-        "local_models": list(router.registry.keys()),
-        "blocked_leaks": AirGap.blocked_attempts
+    REGISTRY: Dict[str, Dict[str, Any]] = {
+        "lite":     {"model": settings.lite_model,     "options": {"temperature": 0.2, "top_p": 0.9}},
+        "standard": {"model": settings.standard_model, "options": {"temperature": 0.7, "top_p": 0.95}},
+        "frontier": {"model": settings.frontier_model, "options": {"temperature": 0.8, "top_p": 1.0}},
     }
 
-@app.post("/ai/query")
-async def process_sovereign_query(req: AIQuery):
+    async def execute_inference(self, prompt: str, complexity: str = "standard") -> str:
+        """
+        Send *prompt* to the local Ollama API and return the generated text.
+        Falls back gracefully if Ollama is not running.
+        """
+        profile = self.REGISTRY.get(complexity, self.REGISTRY["standard"])
+        model_name: str = profile["model"]
+        options: Dict[str, Any] = profile["options"]
+
+        payload = {
+            "model": model_name,
+            "prompt": prompt,
+            "stream": False,
+            "options": options,
+        }
+
+        try:
+            # httpx connects to loopback — this is explicitly permitted even in
+            # sovereign mode (loopback is not blocked by the air-gap controller).
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await client.post(
+                    f"{settings.ollama_base_url}/api/generate",
+                    json=payload,
+                )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("response", "").strip()
+
+        except httpx.ConnectError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    f"Could not connect to Ollama at {settings.ollama_base_url}. "
+                    "Make sure Ollama is running: https://ollama.com"
+                ),
+            )
+        except httpx.HTTPStatusError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Ollama returned HTTP {exc.response.status_code}: {exc.response.text}",
+            )
+
+
+model_router = SovereignModelRouter()
+
+
+# ── FastAPI application ───────────────────────────────────────────────────────
+API_KEY_HEADER = APIKeyHeader(name="X-Sovereign-API-Key", auto_error=True)
+
+
+def _require_api_key(api_key: str = Security(API_KEY_HEADER)) -> str:
+    if api_key != settings.sovereign_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid API key.",
+        )
+    return api_key
+
+
+app = FastAPI(
+    title="Sovereign AI Core",
+    description=(
+        "A local-first, air-gapped AI platform. "
+        "Routes queries to local LLMs via Ollama with a ChromaDB RAG engine "
+        "and AES-256 encrypted vault."
+    ),
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+
+# ── Request / Response models ─────────────────────────────────────────────────
+class AIQuery(BaseModel):
+    prompt: str = Field(..., min_length=1, max_length=8192, description="The question or instruction.")
+    complexity: str = Field("standard", description="One of: lite, standard, frontier.")
+    use_rag: bool = Field(True, description="Augment the prompt with locally retrieved context.")
+
+
+class IngestRequest(BaseModel):
+    doc_id: str = Field(..., description="Unique identifier for the document.")
+    text: str = Field(..., min_length=1, description="Document content to index.")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Optional key/value metadata.")
+
+
+class VaultRequest(BaseModel):
+    plaintext: str = Field(..., description="Data to encrypt.")
+
+
+class VaultDecryptRequest(BaseModel):
+    token: str = Field(..., description="Hex-encoded Fernet token to decrypt.")
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.get("/health", tags=["System"], summary="Health check (no auth required)")
+async def health_check():
+    """Public endpoint — returns service liveness."""
+    return {"status": "ok", "service": "sovereign-ai-core"}
+
+
+@app.get(
+    "/system/status",
+    tags=["System"],
+    dependencies=[Security(_require_api_key)],
+    summary="Full system status",
+)
+async def system_status():
+    """Returns operational state of all subsystems."""
+    return {
+        "air_gap": {
+            "enabled": air_gap.sovereign_mode,
+            "blocked_attempts": air_gap.blocked_attempts,
+        },
+        "vault": "operational",
+        "rag_engine": {
+            "documents_indexed": rag_engine._collection.count(),
+            "vector_store": str(settings.vector_store_path),
+        },
+        "model_registry": list(SovereignModelRouter.REGISTRY.keys()),
+        "ollama_url": settings.ollama_base_url,
+    }
+
+
+@app.post(
+    "/system/lock",
+    tags=["System"],
+    dependencies=[Security(_require_api_key)],
+    summary="Enable air-gap kill-switch",
+)
+async def enable_air_gap():
+    """Engages the network kill-switch — all outbound sockets will be blocked."""
+    air_gap.enable()
+    return {"air_gap": "enabled", "message": "All outbound network traffic is now blocked."}
+
+
+@app.post(
+    "/system/unlock",
+    tags=["System"],
+    dependencies=[Security(_require_api_key)],
+    summary="Disable air-gap kill-switch",
+)
+async def disable_air_gap():
+    """Disengages the network kill-switch — normal network access is restored."""
+    air_gap.disable()
+    return {"air_gap": "disabled", "message": "Network access restored."}
+
+
+@app.post(
+    "/ai/query",
+    tags=["Inference"],
+    dependencies=[Security(_require_api_key)],
+    summary="Query a local LLM with optional RAG context",
+)
+async def sovereign_query(req: AIQuery):
     """
-    Handles an AI query using a local-first pipeline.
-    1. Retrieve local context via RAG.
-    2. Route to the appropriate local model.
-    3. Return response without ever leaving the machine.
+    Full local-first inference pipeline:
+
+    1. (optional) Retrieve relevant context from the local vector store.
+    2. Augment the prompt with retrieved context.
+    3. Forward to the local Ollama model.
+    4. Return the response — data never leaves the machine.
     """
-    context = ""
+    import hashlib
+    from datetime import datetime, timezone
+
+    context_docs: List[str] = []
     if req.use_rag:
         context_docs = rag_engine.retrieve_context(req.prompt)
-        context = "\n".join(context_docs)
 
-    augmented_prompt = f"Context:\n{context}\n\nQuery: {req.prompt}"
-    response = await router.execute_inference(augmented_prompt, req.complexity)
+    augmented_prompt = req.prompt
+    if context_docs:
+        context_block = "\n\n---\n\n".join(context_docs)
+        augmented_prompt = (
+            f"Use the following context to answer the question.\n\n"
+            f"=== Context ===\n{context_block}\n\n"
+            f"=== Question ===\n{req.prompt}"
+        )
 
-    return {"response": response, "source": "Local-Sovereign-Core"}
+    response_text = await model_router.execute_inference(augmented_prompt, req.complexity)
 
-@app.post("/system/lock")
-async def activate_sovereign_mode():
-    """Engages the Air-Gap Kill-Switch."""
-    AirGap.toggle_sovereign_mode(True)
-    return {"status": "Sovereign Mode Active. Outbound network traffic blocked."}
+    # Persist audit record locally
+    with Session(_engine) as session:
+        record = QueryRecord(
+            prompt_hash=hashlib.sha256(req.prompt.encode()).hexdigest(),
+            complexity=req.complexity,
+            used_rag=req.use_rag,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+        session.add(record)
+        session.commit()
 
-@app.post("/system/unlock")
-async def deactivate_sovereign_mode():
-    """Disengages the Air-Gap Kill-Switch."""
-    AirGap.toggle_sovereign_mode(False)
-    return {"status": "Sovereign Mode Disabled. Network access restored."}
+    return {
+        "response": response_text,
+        "model": SovereignModelRouter.REGISTRY.get(req.complexity, SovereignModelRouter.REGISTRY["standard"])["model"],
+        "rag_context_used": bool(context_docs),
+        "context_chunks": len(context_docs),
+        "source": "local-sovereign-core",
+    }
+
+
+@app.post(
+    "/rag/ingest",
+    tags=["RAG"],
+    dependencies=[Security(_require_api_key)],
+    summary="Ingest a document into the local vector store",
+)
+async def ingest_document(req: IngestRequest):
+    """Indexes a document for later retrieval via the RAG pipeline."""
+    rag_engine.ingest_document(req.doc_id, req.text, req.metadata)
+    return {
+        "doc_id": req.doc_id,
+        "status": "indexed",
+        "total_documents": rag_engine._collection.count(),
+    }
+
+
+@app.get(
+    "/rag/search",
+    tags=["RAG"],
+    dependencies=[Security(_require_api_key)],
+    summary="Search the local vector store",
+)
+async def search_rag(query: str, top_k: int = 5):
+    """Returns the most relevant document chunks for the given query."""
+    chunks = rag_engine.retrieve_context(query, top_k=top_k)
+    return {"query": query, "results": chunks, "count": len(chunks)}
+
+
+@app.post(
+    "/vault/encrypt",
+    tags=["Vault"],
+    dependencies=[Security(_require_api_key)],
+    summary="Encrypt a plaintext string",
+)
+async def vault_encrypt(req: VaultRequest):
+    """Encrypts *plaintext* with the local AES-256 vault key."""
+    token = vault.encrypt(req.plaintext)
+    return {"token": token.hex()}
+
+
+@app.post(
+    "/vault/decrypt",
+    tags=["Vault"],
+    dependencies=[Security(_require_api_key)],
+    summary="Decrypt a vault token",
+)
+async def vault_decrypt(req: VaultDecryptRequest):
+    """Decrypts a token previously produced by ``/vault/encrypt``."""
+    try:
+        plaintext = vault.decrypt(bytes.fromhex(req.token))
+    except (ValueError, Exception) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    return {"plaintext": plaintext}
