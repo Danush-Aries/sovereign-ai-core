@@ -1,0 +1,34 @@
+version: "3.9"
+
+# Sovereign AI Core — Docker Compose
+# Starts the API gateway alongside a local Ollama instance.
+# All traffic stays on the internal Docker network (no public ports on Ollama).
+
+services:
+  sovereign-api:
+    build: .
+    container_name: sovereign-api
+    ports:
+      - "127.0.0.1:8000:8000"   # bind to loopback only
+    env_file:
+      - .env
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+    volumes:
+      - sovereign_data:/app/.sovereign
+    depends_on:
+      ollama:
+        condition: service_started
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: sovereign-ollama
+    # No public port — accessible only inside the compose network
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  sovereign_data:
+  ollama_models:
