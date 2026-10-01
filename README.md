@@ -2,8 +2,6 @@
 
 **Local LLM + local RAG + encrypted vault + kill-switch. Zero cloud calls.**
 
-<!-- hero: 1600x600 diagram of the air-gapped inference stack -->
-
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.111-009688?logo=fastapi&logoColor=white)
 ![Ollama](https://img.shields.io/badge/LLM-Ollama-000000?logo=ollama&logoColor=white)
@@ -63,13 +61,6 @@ Every layer is optional but they compose — the kill-switch works whether or no
 
 ---
 
-## Screenshots
-
-<!-- screenshot: architecture.png -->
-<!-- screenshot: killswitch-status.png -->
-
----
-
 ## Stack
 
 | Layer | Tech |
@@ -98,4 +89,4 @@ Built by [Dhanush](https://github.com/Danush-Aries) — AI engineering + cyberse
 
 ## License
 
-MIT.
+MIT — see [LICENSE](LICENSE).
